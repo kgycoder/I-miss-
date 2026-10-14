@@ -78,12 +78,28 @@ public class MainActivity extends AppCompatActivity {
     /** Reference to the bound MusicService. */
     private MusicService musicService;
     private boolean serviceStarted = false;
+    /** 백그라운드에서도 "보이는 창"으로 인식되도록 가시성을 유지시키는 WebView (activity_main.xml). */
+    private BgWebView bgWebView;
+    private long lastStateAtMs = 0;
+    private android.net.wifi.WifiManager.WifiLock wifiLock;
+    private final android.os.Handler mainHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+    /** 곡 전환 순간 등 잠깐의 playing=false 로 백그라운드 재생이 풀리지 않도록 두는 유예 시간 */
+    private static final long BG_GRACE_MS = 20_000L;
+    private final Runnable bgReleaseRunnable = () -> {
+        if (!isPlaying) {
+            releaseWakeLock();
+            if (bgWebView != null) bgWebView.setKeepVisible(false);
+        }
+    };
 
     private final ServiceConnection serviceConnection = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName name, IBinder service) {
             MusicService.LocalBinder binder = (MusicService.LocalBinder) service;
             musicService = binder.getService();
+            // 앱을 닫은 뒤 이어듣던 네이티브 재생이 남아 있는데 UI 가 새로 재생을 시작했다면 이중 재생 방지
+            if (isPlaying && musicService.isBgAudioActive()) musicService.stopBgAudio();
             // Push the current state immediately so the notification is accurate
             refreshServiceNotification();
         }
@@ -125,6 +141,7 @@ public class MainActivity extends AppCompatActivity {
 
         setContentView(R.layout.activity_main);
         webView = findViewById(R.id.webView);
+        if (webView instanceof BgWebView) bgWebView = (BgWebView) webView;
         // Liquid Glass: WebView(frontend)를 Compose backdrop 소스로 옮기고 네이티브 글래스 레이어를 얹는다.
         // 이후 WebView 설정/브릿지/로딩 로직은 기존 그대로 동작한다.
         com.sync.app.glass.GlassHost.install(this, webView);
@@ -175,22 +192,15 @@ public class MainActivity extends AppCompatActivity {
         );
 
         mediaSessionHelper = new MediaSessionHelper(this, cmd ->
-                runOnUiThread(() -> {
-                    // Tell JS whether this was a user-initiated pause/play so that
-                    // the background auto-resume logic can distinguish involuntary
-                    // YouTube auto-pauses from explicit user commands.
-                    if ("pause".equals(cmd)) {
-                        webView.evaluateJavascript("window.__userBgPause=true;", null);
-                    } else {
-                        // play / next / prev all clear the pause-intent flag
-                        webView.evaluateJavascript("window.__userBgPause=false;", null);
-                    }
-                    webView.evaluateJavascript(
-                            "window.__mediaCmd&&window.__mediaCmd('" + cmd + "')", null);
-                }));
+                runOnUiThread(() -> dispatchMediaCommand(cmd)));
 
         webView.addJavascriptInterface(new AndroidBridge(), "AndroidBridge");
         webView.setWebChromeClient(new WebChromeClient());
+
+        // ── 백그라운드 재생 ──
+        installBackgroundVisibilityScript();
+        MusicService.commandSink = cmd -> runOnUiThread(() -> dispatchMediaCommand(cmd));
+        requestNotificationPermissionIfNeeded();
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
@@ -250,6 +260,7 @@ public class MainActivity extends AppCompatActivity {
                     android.webkit.RenderProcessGoneDetail detail) {
                 Log.w(TAG, "WebView renderer killed — reloading page. " +
                         "Native audio continues in MusicService.");
+                startNativeFallback(false);
                 try {
                     // The WebView is no longer usable; reload restores it
                     view.loadUrl(
@@ -303,11 +314,27 @@ public class MainActivity extends AppCompatActivity {
                                 prefetchStreamUrl(vid); // retry if previous fetch failed
                             }
                             isPlaying  = nowPlaying;
+                            lastStateAtMs = android.os.SystemClock.elapsedRealtime();
                             refreshServiceNotification();
                             if (nowPlaying) {
+                                mainHandler.removeCallbacks(bgReleaseRunnable);
+                                // 재생 중에는 WebView 를 항상 "보이는 상태"로 유지 → 백그라운드에서도 YouTube 가 멈추지 않음
+                                if (bgWebView != null) bgWebView.setKeepVisible(true);
                                 acquireWakeLock();
+                                if (!serviceStarted) startMusicService();
+                                // 앱 종료 후 이어듣던 네이티브 재생이 남아 있다면 정리 (이중 재생 방지)
+                                if (musicService != null) {
+                                    if (musicService.isBgAudioActive()) musicService.stopBgAudio();
+                                } else {
+                                    try {
+                                        bindService(new Intent(MainActivity.this, MusicService.class),
+                                                serviceConnection, 0);
+                                    } catch (Exception ignored) {}
+                                }
                             } else {
-                                releaseWakeLock();
+                                // 곡 전환 중 잠깐의 정지 상태에서 락/가시성이 풀리지 않도록 유예 후 해제
+                                mainHandler.removeCallbacks(bgReleaseRunnable);
+                                mainHandler.postDelayed(bgReleaseRunnable, BG_GRACE_MS);
                             }
                         });
                         break;
@@ -999,48 +1026,24 @@ public class MainActivity extends AppCompatActivity {
         // ── CRITICAL: NEVER call webView.onPause() ───────────────────────────
         // webView.onPause() suspends ALL JavaScript execution, which kills the
         // YouTube IFrame player immediately. We keep JS running at all times.
-        // The Foreground Service + WakeLock keep the process alive instead.
         //
-        // Signal JS that the app has gone to background so the auto-resume
-        // mechanism can distinguish involuntary YouTube pauses from user pauses.
+        // 백그라운드 재생 구성:
+        //  1) BgWebView.setKeepVisible(true) : WebView 가 창이 계속 보인다고 인식 → YouTube iframe 이
+        //     document.visibilityState 'hidden' 을 감지해 스스로 멈추는 현상 차단
+        //  2) Foreground Service(+알림, MediaSession) : 프로세스 유지
+        //  3) WakeLock / WifiLock : 화면이 꺼져도 CPU·네트워크 유지
         webView.evaluateJavascript("window.__syncInBg=true;", null);
-        if (isPlaying) {
+        if (isPlaying && bgWebView != null) bgWebView.setKeepVisible(true);
+        if (isPlaying || !lastVideoId.isEmpty()) {
+            // 일시정지 상태여도 알림을 남겨 두어 알림/이어폰에서 다시 재생할 수 있게 한다.
             startMusicService();
+        }
+        if (isPlaying) {
             acquireWakeLock();
-            // ── START NATIVE BACKGROUND AUDIO ─────────────────────────────────────
-            // The WebView renderer process (separate from app process) can be
-            // killed by Android even with RENDERER_PRIORITY_IMPORTANT.
-            // When that happens, YouTube IFrame stops and JS bridge goes silent.
-            // We pre-fetch a direct audio stream URL from YouTube's InnerTube API
-            // and hand it to MusicService (lives in app process) which starts a
-            // native MediaPlayer. This survives renderer death completely.
-            final String vid = lastVideoId;
-            final double pos = lastPosition;
-            String cachedUrl = vid.isEmpty() ? null : streamUrlCache.get(vid);
-            if (cachedUrl != null) {
-                // URL already available — start immediately
-                final String url = cachedUrl;
-                runOnUiThread(() -> {
-                    if (musicService != null) musicService.startBgAudio(url, pos);
-                });
-            } else if (!vid.isEmpty()) {
-                // URL not yet fetched — fetch async and start when ready
-                executor.submit(() -> {
-                    try {
-                        String url = fetchStreamUrlInnerTube(vid);
-                        if (url != null && !url.isEmpty()) {
-                            streamUrlCache.put(vid, url);
-                            runOnUiThread(() -> {
-                                if (musicService != null && isPlaying) {
-                                    musicService.startBgAudio(url, pos);
-                                }
-                            });
-                        }
-                    } catch (Exception e) {
-                        Log.e(TAG, "On-demand stream URL fetch failed for: " + vid, e);
-                    }
-                });
-            }
+            // 네이티브 MediaPlayer 보조 재생은 WebView 렌더러가 죽었을 때(onRenderProcessGone)나
+            // 앱 종료 시(onDestroy)에만 쓴다. 여기서 같이 켜면 소리가 이중으로 난다.
+            // 단, 그 경우를 위해 스트림 URL 은 미리 받아 둔다.
+            if (!lastVideoId.isEmpty()) prefetchStreamUrl(lastVideoId);
         }
     }
 
@@ -1105,17 +1108,20 @@ public class MainActivity extends AppCompatActivity {
 
     @Override protected void onDestroy() {
         super.onDestroy();
+        MusicService.commandSink = null;
+        mainHandler.removeCallbacksAndMessages(null);
+        // 앱을 닫는(스와이프/뒤로가기) 시점에 재생 중이면 네이티브 플레이어로 이어서 재생
+        final boolean handoff = isPlaying && !isChangingConfigurations() && startNativeFallback(true);
         if (mediaSessionHelper != null) {
             mediaSessionHelper.release();
             mediaSessionHelper = null;
         }
         releaseWakeLock();
-        // Stop the service entirely when the activity is destroyed
         try { unbindService(serviceConnection); } catch (Exception ignored) {}
-        if (serviceStarted) {
+        if (serviceStarted && !handoff) {
             stopService(new Intent(this, MusicService.class));
-            serviceStarted = false;
         }
+        serviceStarted = false;
         executor.shutdown();
         webView.destroy();
     }
@@ -1124,12 +1130,18 @@ public class MainActivity extends AppCompatActivity {
 
     private void startMusicService() {
         Intent intent = new Intent(this, MusicService.class);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent);
-        } else {
-            startService(intent);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent);
+            } else {
+                startService(intent);
+            }
+            serviceStarted = true;
+        } catch (Exception e) {
+            // Android 12+: 백그라운드에서의 포그라운드 서비스 시작 제한 등
+            Log.w(TAG, "startMusicService failed", e);
+            return;
         }
-        serviceStarted = true;
         // Bind so we can call updateNotification() on it
         bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE);
     }
@@ -1156,14 +1168,15 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void acquireWakeLock() {
-        if (wakeLock != null && wakeLock.isHeld()) return;
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         if (pm == null) return;
-        wakeLock = pm.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "SYNC::MusicWakeLock");
-        wakeLock.setReferenceCounted(false);
-        wakeLock.acquire(3 * 60 * 60 * 1000L);  // max 3 hours safety cap
+        if (wakeLock == null) {
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SYNC::MusicWakeLock");
+            wakeLock.setReferenceCounted(false);
+        }
+        // 이미 잡혀 있어도 재호출하면 타임아웃이 갱신된다 → 장시간 재생에서도 중간에 풀리지 않음
+        wakeLock.acquire(12 * 60 * 60 * 1000L);
+        acquireWifiLock();
     }
 
     private void releaseWakeLock() {
@@ -1171,6 +1184,107 @@ public class MainActivity extends AppCompatActivity {
             wakeLock.release();
         }
         wakeLock = null;
+        releaseWifiLock();
+    }
+
+    @SuppressWarnings("deprecation")
+    private void acquireWifiLock() {
+        try {
+            if (wifiLock == null) {
+                android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager)
+                        getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                if (wm == null) return;
+                wifiLock = wm.createWifiLock(
+                        android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "SYNC::MusicWifiLock");
+                wifiLock.setReferenceCounted(false);
+            }
+            if (!wifiLock.isHeld()) wifiLock.acquire();
+        } catch (Exception e) {
+            Log.w(TAG, "wifi lock failed", e);
+        }
+    }
+
+    private void releaseWifiLock() {
+        try {
+            if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
+        } catch (Exception ignored) {}
+    }
+
+    /** 알림/잠금화면/이어폰 명령을 WebView 로 전달 */
+    private void dispatchMediaCommand(String cmd) {
+        if (webView == null) return;
+        // 일시정지 상태에서 재생/다음/이전이 오면 먼저 가시성을 복구해야 YouTube 가 재생을 받아들인다.
+        if (!"pause".equals(cmd) && bgWebView != null) {
+            mainHandler.removeCallbacks(bgReleaseRunnable);
+            bgWebView.setKeepVisible(true);
+            acquireWakeLock();
+        }
+        // pause 는 사용자 의도임을 JS 에 알려 백그라운드 자동재개 로직이 되살리지 않게 한다.
+        webView.evaluateJavascript(
+                "window.__userBgPause=" + ("pause".equals(cmd) ? "true" : "false") + ";", null);
+        webView.evaluateJavascript(
+                "window.__mediaCmd&&window.__mediaCmd('" + cmd + "')", null);
+    }
+
+    /**
+     * 네이티브 MediaPlayer 로 이어서 재생 (보조 수단).
+     * @param keepServiceAlive true 면 액티비티 종료 후에도 서비스가 계속 재생하도록 알림을 갱신한다.
+     * @return 시작에 성공했는지
+     */
+    private boolean startNativeFallback(boolean keepServiceAlive) {
+        if (!isPlaying || lastVideoId.isEmpty() || musicService == null) return false;
+        final String url = streamUrlCache.get(lastVideoId);
+        if (url == null) return false;
+        double pos = lastPosition;
+        if (lastStateAtMs > 0) {
+            pos += (android.os.SystemClock.elapsedRealtime() - lastStateAtMs) / 1000.0;
+        }
+        try {
+            musicService.startBgAudio(url, pos);
+            if (keepServiceAlive) {
+                musicService.updateNotification(lastTitle, lastArtist, true, null);
+            }
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "native fallback failed", e);
+            return false;
+        }
+    }
+
+    /**
+     * YouTube iframe(cross-origin) 안에서도 document.hidden / visibilityState 가 항상 '보임'으로 보이도록
+     * 문서 시작 시점에 스크립트를 주입한다. (BgWebView 의 가시성 유지와 이중 안전장치)
+     * androidx.webkit 의 DOCUMENT_START_SCRIPT 를 지원하지 않는 환경에서는 조용히 건너뛴다.
+     */
+    private void installBackgroundVisibilityScript() {
+        final String script =
+                "(function(){try{" +
+                "var d=document,def=function(k,v){try{Object.defineProperty(d,k,{configurable:true,get:function(){return v;}});}catch(e){}};" +
+                "def('hidden',false);def('webkitHidden',false);" +
+                "def('visibilityState','visible');def('webkitVisibilityState','visible');" +
+                "var stop=function(e){e.stopImmediatePropagation();};" +
+                "d.addEventListener('visibilitychange',stop,true);" +
+                "d.addEventListener('webkitvisibilitychange',stop,true);" +
+                "}catch(e){}})();";
+        try {
+            Set<String> origins = new HashSet<>(Arrays.asList(
+                    "https://www.youtube.com",
+                    "https://www.youtube-nocookie.com"));
+            Class<?> compat = Class.forName("androidx.webkit.WebViewCompat");
+            java.lang.reflect.Method m = compat.getMethod(
+                    "addDocumentStartJavaScript", WebView.class, String.class, Set.class);
+            m.invoke(null, webView, script, origins);
+        } catch (Throwable t) {
+            Log.i(TAG, "document-start visibility script not installed: " + t);
+        }
+    }
+
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission("android.permission.POST_NOTIFICATIONS")
+                        != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1001);
+        }
     }
 
 
