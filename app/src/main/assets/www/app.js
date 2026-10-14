@@ -843,7 +843,8 @@ function syncMediaSession() {
         duration: S.dur || 0,
         title: S.track.title,
         artist: S.track.channel || 'SYNC',
-        videoId: S.track.id || ''
+        videoId: S.track.id || '',
+        thumb: (S.track.thumb && /^https?:/.test(S.track.thumb)) ? S.track.thumb : ''
     });
     if (!('mediaSession' in navigator)) return;
     try {
