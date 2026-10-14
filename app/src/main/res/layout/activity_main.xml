@@ -5,7 +5,7 @@
     android:layout_height="match_parent"
     android:background="#08080D">
 
-    <WebView
+    <com.sync.app.BgWebView
         android:id="@+id/webView"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
