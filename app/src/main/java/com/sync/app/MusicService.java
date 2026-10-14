@@ -6,6 +6,7 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
+import android.graphics.Bitmap;
 import android.media.AudioAttributes;
 import android.media.MediaPlayer;
 import android.net.Uri;
@@ -67,6 +68,7 @@ public class MusicService extends Service {
     private double      bgOffsetSec = 0;   // seek offset when player started
     private long        bgStartMs   = 0;   // System.currentTimeMillis() at start
     private WifiManager.WifiLock wifiLock = null;
+    private Bitmap albumArt = null;   // 알림 큰 아이콘(고화질 앨범아트)
 
 
     // ── Lifecycle ────────────────────────────────────────────────────────────
@@ -144,6 +146,11 @@ public class MusicService extends Service {
      * Update the notification with current playback state.
      * Called by MainActivity whenever a mediaState message arrives from JS.
      */
+    /** 알림에 표시할 앨범아트 설정(null 이면 제거). 다음 updateNotification() 호출 때 반영된다. */
+    public void setArt(Bitmap bitmap) {
+        this.albumArt = bitmap;
+    }
+
     public void updateNotification(String title, String artist, boolean playing,
                                    MediaSessionCompat.Token token) {
         this.title   = (title  != null && !title.isEmpty())  ? title  : "SYNC";
@@ -326,6 +333,8 @@ public class MusicService extends Service {
                 .addAction(android.R.drawable.ic_media_previous, "이전", piPrev)
                 .addAction(playIcon, playLabel, piPlay)
                 .addAction(android.R.drawable.ic_media_next,     "다음", piNext);
+
+        if (albumArt != null && !albumArt.isRecycled()) b.setLargeIcon(albumArt);
 
         return b.build();
     }
