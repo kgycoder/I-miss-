@@ -67,6 +67,8 @@ public class MainActivity extends AppCompatActivity {
     private String lastArtist   = "";
     private String lastVideoId  = "";
     private double lastPosition = 0.0;
+    private double lastDuration = 0.0;
+    private long lastArtAttemptMs = 0;
     /**
      * Cache of pre-fetched YouTube audio stream URLs, keyed by videoId.
      * URLs are valid for ~6 hours. Populated async when a track starts.
@@ -81,6 +83,10 @@ public class MainActivity extends AppCompatActivity {
     /** 백그라운드에서도 "보이는 창"으로 인식되도록 가시성을 유지시키는 WebView (activity_main.xml). */
     private BgWebView bgWebView;
     private long lastStateAtMs = 0;
+    /** 알림/미디어 세션용 고화질 앨범아트 (lastArtVideoId 곡의 것) */
+    private android.graphics.Bitmap lastArt = null;
+    private String lastArtVideoId = "";
+    private String lastArtRequestedId = "";
     private android.net.wifi.WifiManager.WifiLock wifiLock;
     private final android.os.Handler mainHandler =
             new android.os.Handler(android.os.Looper.getMainLooper());
@@ -304,14 +310,21 @@ public class MainActivity extends AppCompatActivity {
                             lastTitle    = msg.optString("title",    lastTitle);
                             lastArtist   = msg.optString("artist",   lastArtist);
                             lastPosition = msg.optDouble("position", lastPosition);
+                            lastDuration = msg.optDouble("duration", lastDuration);
                             String vid   = msg.optString("videoId",  "");
                             if (!vid.isEmpty() && !vid.equals(lastVideoId)) {
                                 // New track — evict old URL and start pre-fetching
                                 lastVideoId = vid;
                                 streamUrlCache.remove(vid);
                                 prefetchStreamUrl(vid);
+                                loadAlbumArt(vid, msg.optString("thumb", ""));
                             } else if (!vid.isEmpty() && !streamUrlCache.containsKey(vid)) {
                                 prefetchStreamUrl(vid); // retry if previous fetch failed
+                            }
+                            // 앨범아트 로드가 실패했던 곡은 다음 상태 갱신 때 재시도 (곡당 1회 진행 중 요청만 허용)
+                            if (!vid.isEmpty() && !vid.equals(lastArtVideoId) && !vid.equals(lastArtRequestedId)
+                                    && android.os.SystemClock.elapsedRealtime() - lastArtAttemptMs > 30_000L) {
+                                loadAlbumArt(vid, msg.optString("thumb", ""));
                             }
                             isPlaying  = nowPlaying;
                             lastStateAtMs = android.os.SystemClock.elapsedRealtime();
@@ -1160,8 +1173,40 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /** 고화질 앨범아트를 백그라운드에서 받아 미디어 세션과 알림에 반영 */
+    private void loadAlbumArt(final String vid, final String thumbUrl) {
+        if (vid == null || vid.isEmpty()) return;
+        lastArtRequestedId = vid;
+        lastArtAttemptMs = android.os.SystemClock.elapsedRealtime();
+        executor.submit(() -> {
+            final android.graphics.Bitmap bmp = AlbumArtLoader.load(vid, thumbUrl);
+            runOnUiThread(() -> {
+                if (!vid.equals(lastVideoId)) return;   // 그 사이 다른 곡으로 바뀜
+                if (bmp == null) { lastArtRequestedId = ""; return; }  // 실패 → 다음 갱신 때 재시도
+                lastArt = bmp;
+                lastArtVideoId = vid;
+                if (mediaSessionHelper != null) {
+                    mediaSessionHelper.setArt(vid, bmp);
+                    // 현재 메타데이터를 아트와 함께 다시 설정
+                    try {
+                        org.json.JSONObject m = new org.json.JSONObject();
+                        m.put("title", lastTitle);
+                        m.put("artist", lastArtist);
+                        m.put("position", lastPosition);
+                        m.put("duration", lastDuration);
+                        m.put("playing", isPlaying);
+                        m.put("videoId", vid);
+                        mediaSessionHelper.update(m);
+                    } catch (Exception ignored) {}
+                }
+                refreshServiceNotification();
+            });
+        });
+    }
+
     private void refreshServiceNotification() {
         if (musicService == null) return;
+        musicService.setArt(lastVideoId.equals(lastArtVideoId) ? lastArt : null);
         musicService.updateNotification(
                 lastTitle, lastArtist, isPlaying,
                 mediaSessionHelper != null ? mediaSessionHelper.getSessionToken() : null);
@@ -1242,6 +1287,7 @@ public class MainActivity extends AppCompatActivity {
         try {
             musicService.startBgAudio(url, pos);
             if (keepServiceAlive) {
+                musicService.setArt(lastVideoId.equals(lastArtVideoId) ? lastArt : null);
                 musicService.updateNotification(lastTitle, lastArtist, true, null);
             }
             return true;
