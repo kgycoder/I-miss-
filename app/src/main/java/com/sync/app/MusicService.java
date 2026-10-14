@@ -8,9 +8,14 @@ import android.app.Service;
 import android.content.Intent;
 import android.media.AudioAttributes;
 import android.media.MediaPlayer;
+import android.net.Uri;
+import android.net.wifi.WifiManager;
 import android.os.Binder;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.PowerManager;
+import java.util.HashMap;
+import java.util.Map;
 import android.support.v4.media.session.MediaSessionCompat;
 
 import androidx.core.app.NotificationCompat;
@@ -38,6 +43,10 @@ public class MusicService extends Service {
     static final String ACTION_PREV  = "com.sync.app.PREV";
     static final String ACTION_STOP  = "com.sync.app.STOP";
 
+    /** 알림/잠금화면 버튼 → 액티비티(WebView) 로 명령을 전달하는 통로. 액티비티가 살아 있을 때만 설정된다. */
+    public interface CommandSink { void onCommand(String cmd); }
+    static volatile CommandSink commandSink = null;
+
     // ── Binder for MainActivity ──────────────────────────────────────────────
     public class LocalBinder extends Binder {
         public MusicService getService() { return MusicService.this; }
@@ -57,6 +66,7 @@ public class MusicService extends Service {
     private MediaPlayer bgPlayer    = null;
     private double      bgOffsetSec = 0;   // seek offset when player started
     private long        bgStartMs   = 0;   // System.currentTimeMillis() at start
+    private WifiManager.WifiLock wifiLock = null;
 
 
     // ── Lifecycle ────────────────────────────────────────────────────────────
@@ -68,19 +78,46 @@ public class MusicService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null) {
-            // Notification action buttons forward their intents to MainActivity via broadcast
-            // We just need to keep the service running; MainActivity handles the actual command
-            // via the existing __mediaCmd JS bridge.
-            final String action = intent.getAction();
-            if (ACTION_STOP.equals(action)) {
-                stopSelf();
-                return START_NOT_STICKY;
-            }
+        // startForegroundService() 로 시작된 경우 5초 안에 startForeground() 를 호출해야 하므로 항상 먼저 호출한다.
+        try {
+            startForeground(NOTIF_ID, buildNotification());
+        } catch (Exception e) {
+            android.util.Log.w("MusicService", "startForeground failed", e);
         }
-        // Show the foreground notification immediately so we survive background
-        startForeground(NOTIF_ID, buildNotification());
-        return START_STICKY;
+        final String action = intent != null ? intent.getAction() : null;
+        if (ACTION_STOP.equals(action)) {
+            stopBgAudio();
+            CommandSink s = commandSink;
+            if (s != null && playing) s.onCommand("pause");
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+        if (ACTION_PLAY.equals(action))       handleCommand("play");
+        else if (ACTION_PAUSE.equals(action)) handleCommand("pause");
+        else if (ACTION_NEXT.equals(action))  handleCommand("next");
+        else if (ACTION_PREV.equals(action))  handleCommand("prev");
+        // 프로세스가 죽은 뒤 빈 서비스/유령 알림만 되살아나지 않도록 STICKY 를 쓰지 않는다.
+        return START_NOT_STICKY;
+    }
+
+    /** 알림 버튼 처리: 액티비티가 있으면 WebView 로, 없으면(앱 종료 후 이어듣기) 네이티브 플레이어에 직접 적용. */
+    private void handleCommand(String cmd) {
+        CommandSink s = commandSink;
+        if (s != null) { s.onCommand(cmd); return; }
+        if (bgPlayer == null) return;
+        try {
+            if ("pause".equals(cmd) && bgPlayer.isPlaying()) {
+                bgPlayer.pause();
+                playing = false;
+            } else if ("play".equals(cmd) && !bgPlayer.isPlaying()) {
+                bgPlayer.start();
+                playing = true;
+            } else {
+                return;
+            }
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm != null) nm.notify(NOTIF_ID, buildNotification());
+        } catch (Exception ignored) {}
     }
 
     @Override
@@ -139,7 +176,12 @@ public class MusicService extends Service {
                     .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build());
-            bgPlayer.setDataSource(streamUrl);
+            Map<String, String> headers = new HashMap<>();
+            headers.put("User-Agent",
+                    "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 17_0 like Mac OS X)");
+            bgPlayer.setDataSource(getApplicationContext(), Uri.parse(streamUrl), headers);
+            bgPlayer.setWakeMode(getApplicationContext(), PowerManager.PARTIAL_WAKE_LOCK);
+            acquireWifiLock();
             bgPlayer.setOnPreparedListener(mp -> {
                 int seekMs = (int) (positionSec * 1000);
                 if (seekMs > 0) mp.seekTo(seekMs);
@@ -148,6 +190,19 @@ public class MusicService extends Service {
                 bgStartMs   = System.currentTimeMillis() - seekMs;
                 android.util.Log.d("MusicService",
                         "BG native audio started at " + positionSec + "s");
+            });
+            bgPlayer.setOnCompletionListener(mp -> {
+                // 액티비티 없이 이어듣기 중이던 곡이 끝남 → 알림만 남기고 서비스 정리
+                playing = false;
+                stopBgAudio();
+                if (commandSink == null) {
+                    try {
+                        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                        if (nm != null) nm.notify(NOTIF_ID, buildNotification());
+                    } catch (Exception ignored) {}
+                    stopForeground(2 /* STOP_FOREGROUND_DETACH */);
+                    stopSelf();
+                }
             });
             bgPlayer.setOnErrorListener((mp, what, extra) -> {
                 android.util.Log.e("MusicService",
@@ -169,6 +224,26 @@ public class MusicService extends Service {
             try { bgPlayer.release(); } catch (Exception ignored) {}
             bgPlayer = null;
         }
+        releaseWifiLock();
+    }
+
+    @SuppressWarnings("deprecation")
+    private void acquireWifiLock() {
+        try {
+            if (wifiLock == null) {
+                WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+                if (wm == null) return;
+                wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "SYNC::ServiceWifiLock");
+                wifiLock.setReferenceCounted(false);
+            }
+            if (!wifiLock.isHeld()) wifiLock.acquire();
+        } catch (Exception ignored) {}
+    }
+
+    private void releaseWifiLock() {
+        try {
+            if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
+        } catch (Exception ignored) {}
     }
 
     /**
@@ -217,6 +292,7 @@ public class MusicService extends Service {
         PendingIntent piPrev  = actionPI(ACTION_PREV,  0, piFlags);
         PendingIntent piPlay  = actionPI(playing ? ACTION_PAUSE : ACTION_PLAY, 1, piFlags);
         PendingIntent piNext  = actionPI(ACTION_NEXT,  2, piFlags);
+        PendingIntent piStop  = actionPI(ACTION_STOP,  3, piFlags);
 
         // Tap notification → open MainActivity
         Intent openIntent = new Intent(this, MainActivity.class);
@@ -245,6 +321,7 @@ public class MusicService extends Service {
                 .setSilent(true)
                 .setOnlyAlertOnce(true)
                 .setOngoing(playing)          // swipe-to-dismiss only when paused
+                .setDeleteIntent(piStop)      // 일시정지 상태에서 알림을 밀어서 지우면 서비스도 종료
                 .setStyle(style)
                 .addAction(android.R.drawable.ic_media_previous, "이전", piPrev)
                 .addAction(playIcon, playLabel, piPlay)
@@ -253,10 +330,16 @@ public class MusicService extends Service {
         return b.build();
     }
 
+    /**
+     * 알림 버튼은 액티비티를 앞으로 불러오지 않고 서비스로 전달한다.
+     * (앱이 백그라운드여도 화면 전환 없이 재생/일시정지/이전/다음이 동작)
+     */
     private PendingIntent actionPI(String action, int requestCode, int flags) {
-        Intent i = new Intent(this, MainActivity.class);
+        Intent i = new Intent(this, MusicService.class);
         i.setAction(action);
-        i.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
-        return PendingIntent.getActivity(this, requestCode, i, flags);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            return PendingIntent.getForegroundService(this, requestCode, i, flags);
+        }
+        return PendingIntent.getService(this, requestCode, i, flags);
     }
 }
