@@ -5393,3 +5393,12 @@ html.glass-native .np-ls-scroll,
 html.glass-native #np-fs-lyrics {
     touch-action: none;
 }
+
+
+/* ── 백그라운드 모드(화면 꺼짐/홈): 화면용 렌더링 비용 제거 ── */
+html.bg-mode #bgc { display: none; }
+html.bg-mode *, html.bg-mode *::before, html.bg-mode *::after {
+    animation-play-state: paused !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+}
