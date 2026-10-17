@@ -69,6 +69,11 @@ public class MusicService extends Service {
     private long        bgStartMs   = 0;   // System.currentTimeMillis() at start
     private WifiManager.WifiLock wifiLock = null;
     private Bitmap albumArt = null;   // 알림 큰 아이콘(고화질 앨범아트)
+    // 마지막으로 notify() 한 내용 (같으면 다시 보내지 않음 — 알림 갱신은 비용이 크다)
+    private String  shownTitle = null, shownArtist = null;
+    private boolean shownPlaying = false;
+    private Bitmap  shownArt = null;
+    private MediaSessionCompat.Token shownToken = null;
 
 
     // ── Lifecycle ────────────────────────────────────────────────────────────
@@ -119,6 +124,7 @@ public class MusicService extends Service {
             }
             NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
             if (nm != null) nm.notify(NOTIF_ID, buildNotification());
+            shownTitle = null;   // 직접 갱신했으므로 다음 updateNotification() 은 반드시 반영
         } catch (Exception ignored) {}
     }
 
@@ -158,10 +164,18 @@ public class MusicService extends Service {
         this.playing = playing;
         this.sessionToken = token;
 
+        // JS 가 주기적으로 보내는 동일한 상태로 알림을 계속 다시 만들지 않는다.
+        if (shownTitle != null
+                && this.title.equals(shownTitle) && this.artist.equals(shownArtist)
+                && this.playing == shownPlaying && albumArt == shownArt && token == shownToken) {
+            return;
+        }
         NotificationManager nm =
                 (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (nm != null) {
             nm.notify(NOTIF_ID, buildNotification());
+            shownTitle = this.title; shownArtist = this.artist;
+            shownPlaying = this.playing; shownArt = albumArt; shownToken = token;
         }
     }
 
@@ -206,6 +220,7 @@ public class MusicService extends Service {
                     try {
                         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
                         if (nm != null) nm.notify(NOTIF_ID, buildNotification());
+                        shownTitle = null;
                     } catch (Exception ignored) {}
                     stopForeground(2 /* STOP_FOREGROUND_DETACH */);
                     stopSelf();
