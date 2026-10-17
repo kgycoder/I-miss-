@@ -1,4 +1,28 @@
 /* ════════════════════════════════════════════
+   BACKGROUND MODE — 앱이 백그라운드(화면 꺼짐/홈)일 때 화면용 작업을 완전히 멈춘다.
+   백그라운드 재생을 위해 WebView 를 "항상 보이는 상태"로 유지하기 때문에, 이걸 멈추지 않으면
+   화면이 꺼져 있어도 캔버스/애니메이션/타이머가 계속 돌아 CPU·GPU 발열이 생긴다.
+   - setPausableInterval : 짧은 주기(화면 갱신용) 타이머. 백그라운드 동안 실제로 해제되고, 복귀 시 재등록
+   - window.__syncBgMode(on) : 네이티브(MainActivity.onPause/onResume)가 호출
+════════════════════════════════════════════ */
+window.__bgMode = false;
+const _pIv = new Map(); let _pIvN = 0;
+const _origSetInterval = window.setInterval.bind(window);
+const _origClearInterval = window.clearInterval.bind(window);
+function setPausableInterval(fn, ms) {
+    const id = --_pIvN;
+    const rec = { fn, ms, h: null };
+    _pIv.set(id, rec);
+    if (!window.__bgMode) rec.h = _origSetInterval(fn, ms);
+    return id;
+}
+window.clearInterval = function (id) {
+    const r = _pIv.get(id);
+    if (r) { _origClearInterval(r.h); _pIv.delete(id); return; }
+    _origClearInterval(id);
+};
+
+/* ════════════════════════════════════════════
    DYNAMIC BACKGROUND — Canvas orbs + beat reactor
 ════════════════════════════════════════════ */
 const CVS = document.getElementById('bgc'), CX = CVS.getContext('2d');
@@ -29,8 +53,10 @@ function startBeatTimer(bpm = 120) {
 }
 function stopBeatTimer() { clearInterval(_beatTimer); _beatTimer = null; }
 
-(function bgLoop() {
-    requestAnimationFrame(bgLoop);
+let _bgRafId = null;
+function bgLoop() {
+    if (window.__bgMode) { _bgRafId = null; return; }   // 백그라운드: 프레임 루프 중단
+    _bgRafId = requestAnimationFrame(bgLoop);
     BG.f++;
     BG.h += (BG.th - BG.h) * .005;
     BG.e += (BG.te - BG.e) * .014;
@@ -69,7 +95,20 @@ function stopBeatTimer() { clearInterval(_beatTimer); _beatTimer = null; }
         fg.addColorStop(1, `hsla(${BG.h},80%,72%,0)`);
         CX.fillStyle = fg; CX.fillRect(0, 0, CVS.width, CVS.height);
     }
-})();
+}
+bgLoop();
+
+window.__syncBgMode = function (on) {
+    on = !!on;
+    if (window.__bgMode === on) return;
+    window.__bgMode = on;
+    document.documentElement.classList.toggle('bg-mode', on);
+    _pIv.forEach(r => {
+        if (on) { if (r.h !== null) { _origClearInterval(r.h); r.h = null; } }
+        else if (r.h === null) r.h = _origSetInterval(r.fn, r.ms);
+    });
+    if (!on && !_bgRafId) bgLoop();
+};
 
 /* ════════════════════════════════════════════
    MOOD SYSTEM
@@ -682,7 +721,7 @@ function updateNpColor() {
         });
     }
 }
-setInterval(updateNpColor, 50);
+setPausableInterval(updateNpColor, 50);
 
 /* ════════════════════════════════════════════
    C# ↔ JS BRIDGE
@@ -832,11 +871,16 @@ function normalizeLyricLines(lines) {
 }
 
 let _msTick = 0;
-function syncMediaSession() {
+let _msKey = '', _msPlay = null, _msMetaKey = '';
+function syncMediaSession(fromTick) {
     if (!S.track) return;
     const now = Date.now();
-    if (now - _msTick < 400 && S.playing) return;
-    _msTick = now;
+    const key = (S.track.id || '') + '|' + S.track.title + '|' + (S.track.channel || '');
+    const changed = key !== _msKey || S.playing !== _msPlay;
+    // 주기 호출(틱)은 곡/재생상태가 그대로면 포그라운드 1초, 백그라운드 5초에 한 번만 전송
+    // (매번 보내면 네이티브에서 미디어 세션·알림 갱신이 반복되어 버벅임/발열의 원인이 됨)
+    if (fromTick && !changed && now - _msTick < (window.__bgMode ? 5000 : 1000)) return;
+    _msTick = now; _msKey = key; _msPlay = S.playing;
     post('mediaState', {
         playing: S.playing,
         position: getPlayheadTime(),
@@ -848,11 +892,14 @@ function syncMediaSession() {
     });
     if (!('mediaSession' in navigator)) return;
     try {
-        navigator.mediaSession.metadata = new MediaMetadata({
-            title: S.track.title,
-            artist: S.track.channel || 'SYNC',
-            artwork: [{ src: trackThumbSrc(S.track), sizes: '512x512', type: 'image/jpeg' }]
-        });
+        if (_msMetaKey !== key) {
+            _msMetaKey = key;
+            navigator.mediaSession.metadata = new MediaMetadata({
+                title: S.track.title,
+                artist: S.track.channel || 'SYNC',
+                artwork: [{ src: trackThumbSrc(S.track), sizes: '512x512', type: 'image/jpeg' }]
+            });
+        }
         navigator.mediaSession.playbackState = S.playing ? 'playing' : 'paused';
         if (S.dur > 0) {
             navigator.mediaSession.setPositionState({
@@ -1726,8 +1773,10 @@ initSeekBar('np-lv-pb', 'np-lv-pf');
 ════════════════════════════════════════════ */
 function startTick() {
     stopTick();
+    let _bgTickN = 0;
     S.ticker = setInterval(() => {
         try {
+            if (window.__bgMode && (++_bgTickN % 4)) return;   // 백그라운드: 250ms → 1s
             if (LOCAL.active && LOCAL.audio) {
                 S.cur = LOCAL.audio.currentTime || 0;
                 S.dur = LOCAL.audio.duration || S.track?.dur || 0;
@@ -1736,6 +1785,7 @@ function startTick() {
                 S.cur = S.ytPlayer.getCurrentTime() || 0;
                 S.dur = S.ytPlayer.getDuration() || 0;
             }
+            if (window.__bgMode) { syncMediaSession(true); return; }   // 백그라운드: DOM 갱신 생략
             const pct = S.dur ? (S.cur / S.dur) * 100 : 0;
             const pb = document.getElementById('pb');
             const npb = document.getElementById('np-pb');
@@ -1750,7 +1800,7 @@ function startTick() {
             if (OV.active) { setT('ov-p-cur', S.cur); setT('ov-p-tot', S.dur); }
             const bpf = document.getElementById('bar-prog-fill');
             if (bpf) bpf.style.width = pct.toFixed(2) + '%';
-            syncMediaSession();
+            syncMediaSession(true);
         } catch { }
     }, 250);
 }
@@ -2035,7 +2085,7 @@ function _renderLsLyrics() {
 
 function _startLsTick() {
     _stopLsTick();
-    NP_LS.ticker = setInterval(_syncLsLyrics, 40);
+    NP_LS.ticker = setPausableInterval(_syncLsLyrics, 40);
 }
 function _stopLsTick() {
     clearInterval(NP_LS.ticker);
@@ -2728,7 +2778,7 @@ function _syncOvPlayBtn() {
         ? `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><rect x="2.5" y="2" width="4" height="12" rx="1"/><rect x="9.5" y="2" width="4" height="12" rx="1"/></svg>`
         : `<svg width="17" height="17" viewBox="0 0 17 17" fill="currentColor"><polygon points="4,2.5 14,8.5 4,14.5"/></svg>`;
 }
-function _startOvLyrics() { _stopOvLyrics(); _buildOvLyricsDOM(); OV.curIdx = -1; OV.ticker = setInterval(_syncOvLyrics, 40); }
+function _startOvLyrics() { _stopOvLyrics(); _buildOvLyricsDOM(); OV.curIdx = -1; OV.ticker = setPausableInterval(_syncOvLyrics, 40); }
 function _stopOvLyrics() { clearInterval(OV.ticker); OV.ticker = null; }
 function _buildOvLyricsDOM() { OV.curIdx = -1; post('overlayLyrics', { prev: '', active: '', next1: '', next2: '' }); }
 function _syncOvLyrics() {
@@ -3472,7 +3522,7 @@ function _highlightFsLine(idx) {
 function _startLyricsTick() {
     _stopLyricsTick();
     _clampLyricEnds();
-    LY.ticker = setInterval(_syncLyrics, 40);
+    LY.ticker = setPausableInterval(_syncLyrics, 40);
 }
 function _stopLyricsTick() { clearInterval(LY.ticker); LY.ticker = null; }
 
