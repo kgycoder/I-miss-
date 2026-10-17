@@ -83,6 +83,14 @@ public class MainActivity extends AppCompatActivity {
     /** 백그라운드에서도 "보이는 창"으로 인식되도록 가시성을 유지시키는 WebView (activity_main.xml). */
     private BgWebView bgWebView;
     private long lastStateAtMs = 0;
+    /** onPause ~ onResume 사이(화면 꺼짐/홈/다른 앱) true. 락·가시성 유지는 이 구간에서만 필요하다. */
+    private boolean inBackground = false;
+    private long wakeLockAtMs = 0;
+    private boolean serviceBindTried = false;
+    private final java.util.Set<String> prefetchInFlight =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> prefetchFailAt =
+            new java.util.concurrent.ConcurrentHashMap<>();
     /** 알림/미디어 세션용 고화질 앨범아트 (lastArtVideoId 곡의 것) */
     private android.graphics.Bitmap lastArt = null;
     private String lastArtVideoId = "";
@@ -315,7 +323,8 @@ public class MainActivity extends AppCompatActivity {
                             if (!vid.isEmpty() && !vid.equals(lastVideoId)) {
                                 // New track — evict old URL and start pre-fetching
                                 lastVideoId = vid;
-                                streamUrlCache.remove(vid);
+                                streamUrlCache.clear();      // 이전 곡 URL 은 필요 없음 (메모리/캐시 정리)
+                                prefetchFailAt.clear();
                                 prefetchStreamUrl(vid);
                                 loadAlbumArt(vid, msg.optString("thumb", ""));
                             } else if (!vid.isEmpty() && !streamUrlCache.containsKey(vid)) {
@@ -333,12 +342,14 @@ public class MainActivity extends AppCompatActivity {
                                 mainHandler.removeCallbacks(bgReleaseRunnable);
                                 // 재생 중에는 WebView 를 항상 "보이는 상태"로 유지 → 백그라운드에서도 YouTube 가 멈추지 않음
                                 if (bgWebView != null) bgWebView.setKeepVisible(true);
-                                acquireWakeLock();
+                                // 화면이 켜져 있는 동안엔 WakeLock/WifiLock 이 필요 없다 (발열·배터리 절약)
+                                if (inBackground) acquireWakeLock();
                                 if (!serviceStarted) startMusicService();
                                 // 앱 종료 후 이어듣던 네이티브 재생이 남아 있다면 정리 (이중 재생 방지)
                                 if (musicService != null) {
                                     if (musicService.isBgAudioActive()) musicService.stopBgAudio();
-                                } else {
+                                } else if (!serviceBindTried) {
+                                    serviceBindTried = true;   // 매 상태 메시지마다 bind 를 반복하지 않는다
                                     try {
                                         bindService(new Intent(MainActivity.this, MusicService.class),
                                                 serviceConnection, 0);
@@ -1045,7 +1056,10 @@ public class MainActivity extends AppCompatActivity {
         //     document.visibilityState 'hidden' 을 감지해 스스로 멈추는 현상 차단
         //  2) Foreground Service(+알림, MediaSession) : 프로세스 유지
         //  3) WakeLock / WifiLock : 화면이 꺼져도 CPU·네트워크 유지
+        inBackground = true;
         webView.evaluateJavascript("window.__syncInBg=true;", null);
+        // 화면용 작업(캔버스 루프/애니메이션/짧은 주기 타이머)을 멈춰 백그라운드 CPU·GPU 사용을 없앤다
+        webView.evaluateJavascript("window.__syncBgMode&&window.__syncBgMode(true);", null);
         if (isPlaying && bgWebView != null) bgWebView.setKeepVisible(true);
         if (isPlaying || !lastVideoId.isEmpty()) {
             // 일시정지 상태여도 알림을 남겨 두어 알림/이어폰에서 다시 재생할 수 있게 한다.
@@ -1065,8 +1079,10 @@ public class MainActivity extends AppCompatActivity {
         super.onResume();
         webView.onResume();
         // Tell JS we're back in foreground so auto-resume stops triggering
+        inBackground = false;
         webView.evaluateJavascript(
                 "window.__syncInBg=false;window.__userBgPause=false;", null);
+        webView.evaluateJavascript("window.__syncBgMode&&window.__syncBgMode(false);", null);
         // Sync WebView player to native player position before stopping native
         if (musicService != null && musicService.isBgAudioActive()) {
             double bgPos = musicService.getBgPosition();
@@ -1219,8 +1235,12 @@ public class MainActivity extends AppCompatActivity {
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SYNC::MusicWakeLock");
             wakeLock.setReferenceCounted(false);
         }
-        // 이미 잡혀 있어도 재호출하면 타임아웃이 갱신된다 → 장시간 재생에서도 중간에 풀리지 않음
-        wakeLock.acquire(12 * 60 * 60 * 1000L);
+        // 타임아웃 갱신은 30분에 한 번이면 충분 (12시간 타임아웃) — 상태 메시지마다 다시 잡지 않는다
+        final long now = android.os.SystemClock.elapsedRealtime();
+        if (!wakeLock.isHeld() || now - wakeLockAtMs > 30 * 60 * 1000L) {
+            wakeLock.acquire(12 * 60 * 60 * 1000L);
+            wakeLockAtMs = now;
+        }
         acquireWifiLock();
     }
 
@@ -1229,6 +1249,7 @@ public class MainActivity extends AppCompatActivity {
             wakeLock.release();
         }
         wakeLock = null;
+        wakeLockAtMs = 0;
         releaseWifiLock();
     }
 
@@ -1262,7 +1283,7 @@ public class MainActivity extends AppCompatActivity {
         if (!"pause".equals(cmd) && bgWebView != null) {
             mainHandler.removeCallbacks(bgReleaseRunnable);
             bgWebView.setKeepVisible(true);
-            acquireWakeLock();
+            if (inBackground) acquireWakeLock();
         }
         // pause 는 사용자 의도임을 JS 에 알려 백그라운드 자동재개 로직이 되살리지 않게 한다.
         webView.evaluateJavascript(
@@ -1346,15 +1367,26 @@ public class MainActivity extends AppCompatActivity {
     private void prefetchStreamUrl(String videoId) {
         if (videoId == null || videoId.isEmpty()) return;
         if (streamUrlCache.containsKey(videoId)) return;
+        // 이미 요청 중이면 중복 요청 금지, 실패했으면 30초 동안 재시도 금지
+        // (상태 메시지가 초당 여러 번 오기 때문에 이 가드가 없으면 InnerTube 요청이 폭주한다)
+        Long failedAt = prefetchFailAt.get(videoId);
+        if (failedAt != null && android.os.SystemClock.elapsedRealtime() - failedAt < 30_000L) return;
+        if (!prefetchInFlight.add(videoId)) return;
         executor.submit(() -> {
+            boolean ok = false;
             try {
                 String url = fetchStreamUrlInnerTube(videoId);
                 if (url != null && !url.isEmpty()) {
                     streamUrlCache.put(videoId, url);
+                    ok = true;
                     Log.d(TAG, "Stream URL pre-fetched for: " + videoId);
                 }
             } catch (Exception e) {
                 Log.w(TAG, "Stream URL pre-fetch failed for: " + videoId, e);
+            } finally {
+                prefetchInFlight.remove(videoId);
+                if (!ok) prefetchFailAt.put(videoId, android.os.SystemClock.elapsedRealtime());
+                else prefetchFailAt.remove(videoId);
             }
         });
     }
