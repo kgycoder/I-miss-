@@ -229,6 +229,7 @@
     ['input', 'focusin', 'focusout', 'transitionend', 'animationend']
         .forEach(e => document.addEventListener(e, () => kick(300), { capture: true, passive: true }));
     setInterval(() => {            // 안전망 (프로그램적 value 변경 등 이벤트 없는 변화) — 변화 없으면 전송 안 함
+        if (window.__bgMode) return;           // 백그라운드(화면 꺼짐/홈)에서는 측정 불필요
         const now = performance.now();
         if (now - lastScroll < 250) return;   // 스크롤 중에는 DOM 측정(강제 레이아웃)을 하지 않는다
         geomDirty = true;                      // 유휴 시 기하 자가 검증 (폰트 로딩 등으로 위치가 바뀐 경우 복구)
