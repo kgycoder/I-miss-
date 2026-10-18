@@ -110,6 +110,8 @@ img {
 #bgc {
     position: fixed;
     inset: 0;
+    width: 100%;   /* 캔버스 내부 해상도는 절반이지만 화면 전체 크기로 표시 */
+    height: 100%;
     z-index: 0;
     pointer-events: none;
 }
