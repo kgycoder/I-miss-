@@ -31,10 +31,17 @@ const BG = {
     beat: 0, beatDecay: .04, energyLevel: 0, tEnergyLevel: 0
 };
 
+/* 배경은 흐릿한 그라디언트라 절반 해상도로 그려도 보이는 결과가 같고, 채우기(fill) 비용은 1/4 이 된다.
+   좌표계는 기존 CSS px 그대로 유지(setTransform) — 크기는 CSS 의 100% 로 화면 전체에 맞춘다. */
+const BG_SCALE = 0.5;
+let BG_W = innerWidth, BG_H = innerHeight;
 function szCvs() {
-    CVS.width = innerWidth; CVS.height = innerHeight;
+    BG_W = innerWidth; BG_H = innerHeight;
+    CVS.width = Math.max(1, Math.round(BG_W * BG_SCALE));
+    CVS.height = Math.max(1, Math.round(BG_H * BG_SCALE));
+    CX.setTransform(BG_SCALE, 0, 0, BG_SCALE, 0, 0);
     BG.orbs = Array.from({ length: 7 }, (_, i) => ({
-        x: Math.random() * CVS.width, y: Math.random() * CVS.height,
+        x: Math.random() * BG_W, y: Math.random() * BG_H,
         vx: (Math.random() - .5) * .28, vy: (Math.random() - .5) * .28,
         r: 140 + Math.random() * 280, h: i * 51,
         a: .06 + Math.random() * .10, phase: Math.random() * Math.PI * 2
@@ -54,6 +61,11 @@ function startBeatTimer(bpm = 120) {
 function stopBeatTimer() { clearInterval(_beatTimer); _beatTimer = null; }
 
 let _bgRafId = null;
+let _npElRef = null;
+function _npIsOpen() {
+    if (!_npElRef) _npElRef = document.getElementById('np');
+    return !!(_npElRef && _npElRef.classList.contains('on'));
+}
 function bgLoop() {
     if (window.__bgMode) { _bgRafId = null; return; }   // 백그라운드: 프레임 루프 중단
     _bgRafId = requestAnimationFrame(bgLoop);
@@ -64,20 +76,32 @@ function bgLoop() {
     if (BG.beat > 0) BG.beat = Math.max(0, BG.beat - BG.beatDecay * (1 + BG.energyLevel));
 
     const beat = BG.beat, en = BG.energyLevel;
-    CX.clearRect(0, 0, CVS.width, CVS.height);
 
-    const cx = CVS.width / 2, cy = CVS.height / 2;
+    // 상태/오브 이동은 매 프레임 그대로 진행 → 움직이는 속도·박자 반응은 이전과 동일
+    const speed = 1 + BG.e * 1.4 + beat * (1.5 + en * 3.5);
+    BG.orbs.forEach(o => {
+        o.x += o.vx * speed; o.y += o.vy * speed;
+        if (o.x < -o.r) o.x = BG_W + o.r; if (o.x > BG_W + o.r) o.x = -o.r;
+        if (o.y < -o.r) o.y = BG_H + o.r; if (o.y > BG_H + o.r) o.y = -o.r;
+    });
+
+    // 실제 그리기는 2프레임에 1번(30fps). 매 프레임 전체 화면을 다시 그리면 WebView 합성과
+    // 네이티브 글래스(배경 캡처·블러)까지 60fps 로 다시 계산되어 시간이 지날수록 부하/발열이 커진다.
+    // 일시정지 중에는 오브 이동이 프레임당 1px 미만이고 위에 blur(120px) 오버레이가 덮여 있어 10fps 로도 구분이 안 된다.
+    if (BG.f % (BG.playing ? 2 : 6)) return;
+    // 전체화면 플레이어(#np, 불투명)가 덮고 있는 동안엔 보이지 않으므로 그리지 않는다.
+    if (_npIsOpen()) return;
+
+    CX.clearRect(0, 0, BG_W, BG_H);
+
+    const cx = BG_W / 2, cy = BG_H / 2;
     const baseL = BG.playing ? 3 + beat * 5 : 1.5;
-    const g = CX.createRadialGradient(cx, cy, 0, cx, cy, CVS.width * (.80 + beat * .20));
+    const g = CX.createRadialGradient(cx, cy, 0, cx, cy, BG_W * (.80 + beat * .20));
     g.addColorStop(0, `hsl(${BG.h},${16 + en * 14}%,${baseL + 1}%)`);
     g.addColorStop(1, `hsl(${BG.h + 40},${10 + en * 8}%,${baseL - 1}%)`);
-    CX.fillStyle = g; CX.fillRect(0, 0, CVS.width, CVS.height);
+    CX.fillStyle = g; CX.fillRect(0, 0, BG_W, BG_H);
 
     BG.orbs.forEach(o => {
-        const speed = 1 + BG.e * 1.4 + beat * (1.5 + en * 3.5);
-        o.x += o.vx * speed; o.y += o.vy * speed;
-        if (o.x < -o.r) o.x = CVS.width + o.r; if (o.x > CVS.width + o.r) o.x = -o.r;
-        if (o.y < -o.r) o.y = CVS.height + o.r; if (o.y > CVS.height + o.r) o.y = -o.r;
         const pulse = Math.sin(BG.f * .007 + o.phase) * .18 + beat * .40;
         const r = o.r * (1 + pulse);
         const og = CX.createRadialGradient(o.x, o.y, 0, o.x, o.y, r);
@@ -90,10 +114,10 @@ function bgLoop() {
 
     if (beat > 0.12 && BG.playing) {
         const fa = beat * .12 * en;
-        const fg = CX.createRadialGradient(cx, cy * .5, 0, cx, cy, CVS.width * .75);
+        const fg = CX.createRadialGradient(cx, cy * .5, 0, cx, cy, BG_W * .75);
         fg.addColorStop(0, `hsla(${BG.h},80%,72%,${fa})`);
         fg.addColorStop(1, `hsla(${BG.h},80%,72%,0)`);
-        CX.fillStyle = fg; CX.fillRect(0, 0, CVS.width, CVS.height);
+        CX.fillStyle = fg; CX.fillRect(0, 0, BG_W, BG_H);
     }
 }
 bgLoop();
@@ -504,41 +528,48 @@ function renderNpMesh(beat, en) {
         if (nd.v < 0.04 || nd.v > 0.96) { nd.dv *= -1; nd.v = Math.max(0.04, Math.min(0.96, nd.v)); }
     });
     const R = NP_MESH.RES;
-    const imgData = octx.createImageData(R, R);
+    // ImageData / 배열을 매 호출마다 새로 만들면(초당 20회) GC 가 계속 돌며 프레임이 떨어진다 → 한 번만 만들어 재사용
+    let imgData = NP_MESH._img;
+    if (!imgData || imgData.width !== R) imgData = NP_MESH._img = octx.createImageData(R, R);
     const buf = imgData.data;
     const N = NP_MESH.nodes.length;
-    const cols = NP_MESH.colors.map(c => {
-        const sB = Math.min(100, c.s + bt * 14 * en);
-        const lB = Math.min(72, c.l + bt * 12 * en);
-        return hslToRgb(c.h, sB, lB);
-    });
-    const waveNodes = NP_MESH.nodes.map((nd, i) => {
-        const amp = nd.amp * (1 + bt * 1.8 * en);
-        return {
-            u: nd.u + Math.sin(nd.phase) * amp + Math.cos(nd.phase2 + i * 0.9) * amp * 0.5,
-            v: nd.v + Math.cos(nd.phase) * amp + Math.sin(nd.phase2 * 1.1 + i) * amp * 0.5,
+    let sc = NP_MESH._sc;
+    if (!sc || sc.n !== N) {
+        sc = NP_MESH._sc = {
+            n: N, cr: new Float64Array(N), cg: new Float64Array(N), cb: new Float64Array(N),
+            nu: new Float64Array(N), nv: new Float64Array(N)
         };
-    });
+    }
+    const cr = sc.cr, cg = sc.cg, cb = sc.cb, nu = sc.nu, nv = sc.nv;
+    for (let i = 0; i < N; i++) {
+        const c = NP_MESH.colors[i];
+        const rgb = hslToRgb(c.h, Math.min(100, c.s + bt * 14 * en), Math.min(72, c.l + bt * 12 * en));
+        cr[i] = rgb[0]; cg[i] = rgb[1]; cb[i] = rgb[2];
+        const nd = NP_MESH.nodes[i];
+        const amp = nd.amp * (1 + bt * 1.8 * en);
+        nu[i] = nd.u + Math.sin(nd.phase) * amp + Math.cos(nd.phase2 + i * 0.9) * amp * 0.5;
+        nv[i] = nd.v + Math.cos(nd.phase) * amp + Math.sin(nd.phase2 * 1.1 + i) * amp * 0.5;
+    }
+    let idx = 0;
     for (let py = 0; py < R; py++) {
         const v = py / R;
         for (let px = 0; px < R; px++) {
             const u = px / R;
             let wSum = 0, wr = 0, wg = 0, wb = 0;
             for (let ni = 0; ni < N; ni++) {
-                const wn = waveNodes[ni];
-                const dx = u - wn.u, dy = v - wn.v;
+                const dx = u - nu[ni], dy = v - nv[ni];
                 const dist2 = dx * dx + dy * dy;
                 const w = 1.0 / (dist2 * dist2 * dist2 + 1e-7);
-                wr += cols[ni][0] * w;
-                wg += cols[ni][1] * w;
-                wb += cols[ni][2] * w;
+                wr += cr[ni] * w;
+                wg += cg[ni] * w;
+                wb += cb[ni] * w;
                 wSum += w;
             }
-            const idx = (py * R + px) * 4;
             buf[idx] = wr / wSum | 0;
             buf[idx + 1] = wg / wSum | 0;
             buf[idx + 2] = wb / wSum | 0;
             buf[idx + 3] = 255;
+            idx += 4;
         }
     }
     octx.putImageData(imgData, 0, 0);
@@ -619,13 +650,37 @@ function renderParticles() {
 }
 
 let _beatCount = 0;
+/* 박자 효과는 화면에 보이는 카드에만 적용한다. 검색/홈/즐겨찾기 카드 수백 개의 style 을
+   초당 20번 모두 건드리면 스타일 재계산·페인트가 폭증한다. */
+const _visCards = new Set();
+let _cardIO = null;
+function _observeCard(c) {
+    if (!('IntersectionObserver' in window)) return;
+    if (!_cardIO) {
+        _cardIO = new IntersectionObserver(es => {
+            for (const e of es) { if (e.isIntersecting) _visCards.add(e.target); else _visCards.delete(e.target); }
+        }, { rootMargin: '80px' });
+    }
+    _cardIO.observe(c);
+}
+function _beatCards() {
+    if (!_cardIO) return document.querySelectorAll('.card');
+    const out = [];
+    _visCards.forEach(c => { if (c.isConnected) out.push(c); else _visCards.delete(c); });
+    return out;
+}
+
+let _lastNpGlow = '', _lastNpCol = '', _npIdleTick = 0, _beatDirty = false, _vbList = null;
 function updateNpColor() {
     _moodH += (_tMoodH - _moodH) * .04;
     const h = Math.round(_moodH), s = _moodS, l = _moodL;
     const col = `hsl(${h},${s}%,${l}%)`;
     const glow = `hsla(${h},${s}%,${l}%,0.4)`;
     const npEl = document.getElementById('np');
-    if (npEl) { npEl.style.setProperty('--np-glow', glow); npEl.style.setProperty('--np-acc', col); }
+    if (npEl && (glow !== _lastNpGlow || col !== _lastNpCol)) {
+        _lastNpGlow = glow; _lastNpCol = col;
+        npEl.style.setProperty('--np-glow', glow); npEl.style.setProperty('--np-acc', col);
+    }
 
     const npOpen = npEl?.classList.contains('on');
     const beat = BG.beat;
@@ -653,16 +708,23 @@ function updateNpColor() {
             npTitle.style.textShadow = `0 0 ${beat * 20 * en}px hsla(${h},${s}%,${l + 10}%,${(beat * .6).toFixed(2)})`;
         } else if (npTitle) npTitle.style.textShadow = '';
     } else {
-        renderNpMesh(0, 0.05);
+        // 플레이어(NP)가 닫혀 있으면 보이지 않는 메시를 그릴 필요가 없다(이전엔 닫혀 있어도 50ms 마다
+        // 180×180 픽셀 계산을 계속했다). 색 보간만 계속해서 열 때 색이 이미 수렴해 있도록 한다.
+        // NP 가 열려 있고 일시정지인 경우엔 변화가 매우 느리므로 3틱(150ms)에 한 번만 그린다.
+        if (npOpen) {
+            if (++_npIdleTick % 3 === 0) renderNpMesh(0, 0.05);
+        } else {
+            _lerpMeshColors();
+        }
         const pulse = document.getElementById('np-pulse');
         if (pulse) pulse.style.display = S.playing ? 'block' : 'none';
     }
 
     _beatCount++;
 
-    const vb = document.querySelectorAll('.vb');
     if (S.playing) {
-        vb.forEach((b, i) => {
+        if (!_vbList || !_vbList.length) _vbList = document.querySelectorAll('.vb');
+        _vbList.forEach((b, i) => {
             b.style.background = `hsl(${h},${s}%,62%)`;
             if (beat > .06) {
                 const ht = 1 + beat * en * (0.8 + Math.sin(i * 1.4 + BG.f * .08) * 0.5);
@@ -672,7 +734,8 @@ function updateNpColor() {
     }
 
     if (S.playing && beat > .04) {
-        document.querySelectorAll('.card').forEach((card, ci) => {
+        _beatDirty = true;
+        _beatCards().forEach((card, ci) => {
             card.classList.add('beat-active');
             const isPlaying = card.classList.contains('playing');
             const phase = Math.sin(BG.f * .06 + ci * 0.72);
@@ -680,7 +743,8 @@ function updateNpColor() {
             // 가로 스크롤 행(.hrow, .am-chart-row) 안의 카드는 위로 들어올리거나
             // 크게 확대하면 컨테이너 밖으로 밀려나 잘리므로, 이동 없이 은은한
             // 확대+글로우만 적용하는 "컨테이너 안전" 버전을 사용한다.
-            const inScrollRow = !!card.closest('.hrow, .am-chart-row');
+            if (card._inRow === undefined) card._inRow = !!card.closest('.hrow, .am-chart-row');
+            const inScrollRow = card._inRow;
             if (isPlaying) {
                 if (inScrollRow) {
                     const scC = 1 + beat * .022 * en;
@@ -710,7 +774,8 @@ function updateNpColor() {
                 card.style.borderColor = `rgba(255,255,255,${(.07 + beat * .10 * en).toFixed(3)})`;
             }
         });
-    } else if (!S.playing || beat <= .02) {
+    } else if (_beatDirty && (!S.playing || beat <= .02)) {
+        _beatDirty = false;
         document.querySelectorAll('.card.beat-active').forEach(card => {
             card.classList.remove('beat-active');
             if (!card.matches(':hover')) {
@@ -1129,49 +1194,103 @@ function ytThumbNext(img, id, finalSrc) {
     else if (!img.dataset.f2) { img.dataset.f2 = '1'; img.src = finalSrc || getThumbSd(id); }
 }
 function ytThumbCheck(img, id, finalSrc) {
+    if (img.style.objectViewBox) img.style.objectViewBox = '';   // 이전 이미지에 적용했던 여백 크롭 초기화
     if (isYtThumbPlaceholder(img)) { ytThumbNext(img, id, finalSrc); return; }
     ytCropBars(img);
 }
 
 /* 일부 영상은 섬네일 이미지 안에 검은 여백(레터/필러박스)이 그대로 들어 있다.
-   로드된 이미지의 가장자리를 검사해 여백이 있으면 실제 내용 영역만 잘라 교체한다.
+   로드된 이미지의 가장자리를 검사해 여백이 있으면 실제 내용 영역만 보이도록 잘라낸다.
+   - 일반 이미지: CSS object-view-box 로 "보이는 영역"만 지정 (픽셀 복사/인코딩 없음, 추가 메모리 없음)
+   - 미니플레이어 아트(b-art, 네이티브 글래스가 src 를 읽어감) / object-view-box 미지원: 작은 data: URL 로 교체
+   - 분석은 한 번에 하나씩 순차 처리하고 결과는 URL 별로 캐시 → 목록을 다시 그려도 재분석/버벅임 없음
    (CORS 로 읽을 수 없거나 여백이 없으면 아무 것도 하지 않음) */
-function ytCropBars(img) {
-    const src = img.currentSrc || img.src;
-    if (!src || /^(data|blob):/.test(src) || !/^https?:/.test(src)) return;
+const _OVB = !!(window.CSS && CSS.supports && CSS.supports('object-view-box', 'inset(1%)'));
+const _cropCache = new Map();          // src -> {t,r,b,l}(0~1 비율) | null(여백 없음)
+const _cropJobs = [];
+let _cropBusy = false;
+
+function _cacheCrop(src, res) {
+    if (_cropCache.size >= 400) _cropCache.delete(_cropCache.keys().next().value);
+    _cropCache.set(src, res);
+}
+
+/* 여백 비율 계산. 여백이 없거나 판단 불가면 null */
+function _detectBars(probe) {
+    const nw = probe.naturalWidth, nh = probe.naturalHeight;
+    if (!nw || !nh || (nw === 120 && nh === 90)) return null;
+    const sw = 96, sh = Math.max(8, Math.round(sw * nh / nw));
+    const sc = document.createElement('canvas'); sc.width = sw; sc.height = sh;
+    const sx = sc.getContext('2d', { willReadFrequently: true });
+    sx.drawImage(probe, 0, 0, sw, sh);
+    const d = sx.getImageData(0, 0, sw, sh).data;
+    const dark = (x, y) => { const k = (y * sw + x) * 4; return (d[k] + d[k + 1] + d[k + 2]) / 3 < 22; };
+    const rowDark = y => { let n = 0; for (let x = 0; x < sw; x++) if (dark(x, y)) n++; return n / sw > 0.97; };
+    const colDark = x => { let n = 0; for (let y = 0; y < sh; y++) if (dark(x, y)) n++; return n / sh > 0.97; };
+    const maxY = Math.floor(sh * 0.4), maxX = Math.floor(sw * 0.4);
+    let t = 0, b = 0, l = 0, r = 0;
+    while (t < maxY && rowDark(t)) t++;
+    while (b < maxY && rowDark(sh - 1 - b)) b++;
+    while (l < maxX && colDark(l)) l++;
+    while (r < maxX && colDark(sw - 1 - r)) r++;
+    if (t < 2 && b < 2 && l < 2 && r < 2) return null;            // 여백 없음
+    if ((sw - l - r) < sw * 0.4 || (sh - t - b) < sh * 0.4) return null;
+    // 경계 행이 여백/내용 혼합이라 어둡지 않게 판정된 경우를 위해 안쪽으로 반 칸 더 자른다
+    const m = 0.5;
+    return {
+        t: t > 0 ? (t + m) / sh : 0, b: b > 0 ? (b + m) / sh : 0,
+        l: l > 0 ? (l + m) / sw : 0, r: r > 0 ? (r + m) / sw : 0
+    };
+}
+
+function _applyCrop(img, src, res, probe) {
+    if (!res || (img.currentSrc || img.src) !== src) return;
+    if (_OVB && img.id !== 'b-art') {
+        const pc = v => (v * 100).toFixed(2) + '%';
+        img.style.objectViewBox = `inset(${pc(res.t)} ${pc(res.r)} ${pc(res.b)} ${pc(res.l)})`;
+        return;
+    }
+    if (!probe) return;
+    const nw = probe.naturalWidth, nh = probe.naturalHeight;
+    const cx = Math.round(res.l * nw), cy = Math.round(res.t * nh);
+    const cw = Math.round(nw * (1 - res.l - res.r)), ch = Math.round(nh * (1 - res.t - res.b));
+    if (cw < 8 || ch < 8) return;
+    const maxW = img.id === 'b-art' ? 192 : 640;   // 네이티브 글래스가 이 문자열을 계속 직렬화하므로 작게
+    const scale = Math.min(1, maxW / cw);
+    const oc = document.createElement('canvas');
+    oc.width = Math.round(cw * scale); oc.height = Math.round(ch * scale);
+    oc.getContext('2d').drawImage(probe, cx, cy, cw, ch, 0, 0, oc.width, oc.height);
+    img.src = oc.toDataURL('image/jpeg', 0.86);
+}
+
+function _cropNext() {
+    if (_cropBusy) return;
+    const job = _cropJobs.shift();
+    if (!job) return;
+    _cropBusy = true;
+    const done = () => { _cropBusy = false; setTimeout(_cropNext, 0); };
+    const { img, src } = job;
+    if (window.__bgMode || !img.isConnected || (img.currentSrc || img.src) !== src) { done(); return; }
     const probe = new Image();
     probe.crossOrigin = 'anonymous';
     probe.onload = () => {
-        try {
-            const nw = probe.naturalWidth, nh = probe.naturalHeight;
-            if (!nw || !nh || (nw === 120 && nh === 90)) return;
-            const sw = 96, sh = Math.max(8, Math.round(sw * nh / nw));
-            const sc = document.createElement('canvas'); sc.width = sw; sc.height = sh;
-            const sx = sc.getContext('2d', { willReadFrequently: true });
-            sx.drawImage(probe, 0, 0, sw, sh);
-            const d = sx.getImageData(0, 0, sw, sh).data;
-            const dark = (x, y) => { const k = (y * sw + x) * 4; return (d[k] + d[k + 1] + d[k + 2]) / 3 < 22; };
-            const rowDark = y => { let n = 0; for (let x = 0; x < sw; x++) if (dark(x, y)) n++; return n / sw > 0.97; };
-            const colDark = x => { let n = 0; for (let y = 0; y < sh; y++) if (dark(x, y)) n++; return n / sh > 0.97; };
-            const maxY = Math.floor(sh * 0.4), maxX = Math.floor(sw * 0.4);
-            let t = 0, b = 0, l = 0, r = 0;
-            while (t < maxY && rowDark(t)) t++;
-            while (b < maxY && rowDark(sh - 1 - b)) b++;
-            while (l < maxX && colDark(l)) l++;
-            while (r < maxX && colDark(sw - 1 - r)) r++;
-            if (t < 2 && b < 2 && l < 2 && r < 2) return;      // 여백 없음
-            const cx = Math.round(l / sw * nw), cy = Math.round(t / sh * nh);
-            const cw = Math.round((sw - l - r) / sw * nw), ch = Math.round((sh - t - b) / sh * nh);
-            if (cw < nw * 0.4 || ch < nh * 0.4) return;
-            const scale = Math.min(1, 640 / cw);
-            const oc = document.createElement('canvas');
-            oc.width = Math.round(cw * scale); oc.height = Math.round(ch * scale);
-            oc.getContext('2d').drawImage(probe, cx, cy, cw, ch, 0, 0, oc.width, oc.height);
-            const out = oc.toDataURL('image/jpeg', 0.88);
-            if ((img.currentSrc || img.src) === src) img.src = out;   // 그 사이 다른 곡으로 바뀌었으면 무시
-        } catch (e) { /* 캔버스 접근 불가 → 원본 유지 */ }
+        let res = null;
+        try { res = _detectBars(probe); } catch (e) { res = null; }
+        if (_OVB && img.id !== 'b-art') _cacheCrop(src, res);
+        try { _applyCrop(img, src, res, probe); } catch (e) { }
+        done();
     };
+    probe.onerror = done;
     probe.src = src;
+}
+
+function ytCropBars(img) {
+    const src = img.currentSrc || img.src;
+    if (!src || /^(data|blob):/.test(src) || !/^https?:/.test(src)) return;
+    if (_OVB && img.id !== 'b-art' && _cropCache.has(src)) { _applyCrop(img, src, _cropCache.get(src)); return; }
+    if (_cropJobs.length > 200) _cropJobs.shift();       // 스크롤로 밀려난 오래된 요청은 버림
+    _cropJobs.push({ img, src });
+    _cropNext();
 }
 
 /* 로컬 저장용 썸네일은 hqdefault.jpg(480×360, 4:3 컨테이너)를 쓰면
@@ -1214,6 +1333,7 @@ function mkCard(t, i, playFn) {
     const pl = S.track?.id === t.id;
     const c = document.createElement('div');
     c.className = 'card' + (pl ? ' playing' : '');
+    _observeCard(c);
     c.dataset.id = t.id;
     c.style.animationDelay = (i * .045) + 's';
     c.innerHTML = `
@@ -1811,6 +1931,7 @@ function stopTick() { clearInterval(S.ticker); }
 ════════════════════════════════════════════ */
 function openNP() {
     document.getElementById('np').classList.add('on');
+    _npIdleTick = 2;   // 일시정지 상태여도 열자마자 다음 틱에 메시를 한 번 그린다
     updFavBtn();
     if (LY.lines.length > 0) _startLyricsTick();
 }
@@ -2102,11 +2223,13 @@ function _syncLsLyrics() {
 
         // 재생바 업데이트
         const pf = document.getElementById('np-ls-pf');
-        if (pf) pf.style.width = pct.toFixed(2) + '%';
+        const pctS = pct.toFixed(2) + '%';
+        if (pf && pf._v !== pctS) { pf._v = pctS; pf.style.width = pctS; }
         const curEl = document.getElementById('np-ls-cur');
         const totEl = document.getElementById('np-ls-tot');
-        if (curEl) curEl.textContent = fmt(cur);
-        if (totEl) totEl.textContent = fmt(dur);
+        const curS = fmt(cur), totS = fmt(dur);
+        if (curEl && curEl._v !== curS) { curEl._v = curS; curEl.textContent = curS; }
+        if (totEl && totEl._v !== totS) { totEl._v = totS; totEl.textContent = totS; }
 
         // 아트 / 곡명 동기화
         const origArt = document.getElementById('np-art');
