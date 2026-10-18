@@ -201,6 +201,8 @@
         for (const r of recs) {
             const t = r.target.nodeType === 1 ? r.target : r.target.parentElement;
             if (!t || t.id === 'bar-prog-fill') continue;
+            // 박자 효과(카드 transform/shadow, 비주얼라이저 등)는 글래스 레이아웃과 무관 — closest() 비용도 아낀다
+            if (t.classList && (t.classList.contains('card') || t.classList.contains('vb'))) continue;
             if (t.id === 'np' || t.classList.contains('view') || t.id === 'bar') { if (t.id === 'np') syncNpLock(); once = true; continue; }
             if (t.closest) {
                 if (t.closest(OVERLAYS)) { burst = true; break; }
@@ -226,8 +228,14 @@
         settleT = setTimeout(() => { try { window.GlassBridge.settled(window.scrollY || 0); } catch (e) {} }, 150);
     }, { passive: true });
     ['resize', 'orientationchange'].forEach(e => window.addEventListener(e, () => kick(400), { passive: true }));
+    /* 박자 효과로 계속 일어나는 카드/비주얼라이저의 transition·animation 종료는 레이아웃을 바꾸지 않으므로
+       무시한다 (재생 중 kick → 프레임마다 collect()+JSON.stringify 가 반복되던 부하 제거). */
+    const BEAT_FX = '.card, #vizz, #np-pulse, #np-particles, .c-now-bar';
     ['input', 'focusin', 'focusout', 'transitionend', 'animationend']
-        .forEach(e => document.addEventListener(e, () => kick(300), { capture: true, passive: true }));
+        .forEach(ev => document.addEventListener(ev, e => {
+            if ((ev === 'transitionend' || ev === 'animationend') && e.target && e.target.closest && e.target.closest(BEAT_FX)) return;
+            kick(300);
+        }, { capture: true, passive: true }));
     setInterval(() => {            // 안전망 (프로그램적 value 변경 등 이벤트 없는 변화) — 변화 없으면 전송 안 함
         if (window.__bgMode) return;           // 백그라운드(화면 꺼짐/홈)에서는 측정 불필요
         const now = performance.now();
